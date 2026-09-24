@@ -72,6 +72,23 @@ function errorResponse(err: import("@/lib/api/errors").ApiErrorResult): Response
   return Response.json(err.body, { status: err.status, headers: { ...err.headers, "cache-control": "no-store" } });
 }
 
+function actionVerdictToError(gate: { reason?: string; detail?: string }, capability: string): import("@/lib/api/errors").ApiErrorResult {
+  const reason = gate.reason ?? "forbidden";
+  if (reason === "platform_paused" || reason === "paused") {
+    return apiError("agent_paused", gate.detail ?? "Agent or platform is paused");
+  }
+  if (reason === "revoked") {
+    return apiError("agent_revoked", gate.detail ?? "Agent has been revoked");
+  }
+  if (reason === "rate_limit_exceeded") {
+    return apiError("rate_limited", gate.detail ?? "Rate limit exceeded");
+  }
+  if (reason === "missing_capability" || reason === "insufficient_authority") {
+    return apiError("capability_missing", gate.detail ?? `Missing capability ${capability}`);
+  }
+  return apiError("forbidden", gate.detail ?? gate.reason ?? "Action not authorized");
+}
+
 async function verify(address: string, message: string, signature: string): Promise<boolean> {
   return verifyAgentSignature({ address, message, signature });
 }

@@ -53,7 +53,15 @@ applyWorkerGeminiKey("ORACLE_GEMINI_API_KEY");
 
 import { requireEnv, requireAnyLLMKey, applyWorkerGeminiKey, createThrottle } from "../../lib/agent-bootstrap";
 import { kellyFraction } from "../../lib/kelly";
-import { type VerdictPayload } from "../../lib/verdict";
+import {
+  type VerdictPayload,
+  type ResearchCitation,
+  checkSettlementGuards,
+  validateResearchCitation,
+  validateCitationsList,
+  MAX_VERDICT_CITATIONS,
+} from "../../lib/verdict";
+import { pauseState } from "../../lib/ops/flags";
 import {
   parseLLMVerdictWithRetry,
   VERDICT_LLM_SCHEMA,
@@ -449,6 +457,18 @@ Reply JSON only: { "final": true | false }
 async function settle(claim: ClaimOnChain): Promise<boolean> {
   console.log(`\n[settle] Claim #${claim.id}: "${claim.question.slice(0, 60)}..."`);
 
+  // Guard check: ensure operational policy and claim preconditions permit settlement
+  const pause = pauseState("oracle_settlement");
+  const guardErr = checkSettlementGuards({
+    claimState: claim.state,
+    deadline: claim.deadline,
+    paused: pause.paused,
+  });
+  if (guardErr) {
+    console.log(`[settle] Claim #${claim.id} settlement blocked (${guardErr.reason}): ${guardErr.detail}`);
+    return false;
+  }
+
   const evidence     = await fetchEvidence(claim);
   console.log(`[settle] Evidence fetcher: ${evidence.fetcher}`);
 
@@ -520,6 +540,36 @@ async function settle(claim: ClaimOnChain): Promise<boolean> {
   const evidenceHash = hashEvidence(commit);
   const trusted      = applyFetcherTrust(rawVerdict, evidence.fetcher);
   const verdict      = tierVerdict(trusted);
+
+  // Attach canonical research citations to the verdict payload
+  const citations: ResearchCitation[] = [];
+  if (claim.resolution_url && claim.resolution_url.startsWith("http")) {
+    const canonical = validateResearchCitation({
+      url: claim.resolution_url,
+      contentHash: evidenceHash,
+      capturedAt: Date.now(),
+      trustTier: evidence.fetcher === "coingecko-api" ? "primary" : evidence.fetcher === "none" ? "unverified" : "corroborating",
+      fetcher: evidence.fetcher,
+      title: claim.question ? claim.question.slice(0, 100) : undefined,
+    });
+    if (canonical) {
+      citations.push(canonical);
+    }
+  }
+  if (Array.isArray(rawVerdict.citations) && rawVerdict.citations.length > 0) {
+    const validatedLlmCitations = validateCitationsList(rawVerdict.citations);
+    if (validatedLlmCitations.ok && validatedLlmCitations.citations) {
+      for (const c of validatedLlmCitations.citations) {
+        if (!citations.some((existing) => existing.url === c.url)) {
+          citations.push(c);
+        }
+      }
+    }
+  }
+  if (citations.length > 0) {
+    verdict.citations = citations.slice(0, MAX_VERDICT_CITATIONS);
+    console.log(`[settle] Citations (${verdict.citations.length}): ${verdict.citations.map((c) => c.domain).join(", ")}`);
+  }
 
   const tierTag =
     verdict.verdict !== rawVerdict.verdict ? "REFUND" :
