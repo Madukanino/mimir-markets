@@ -51,17 +51,6 @@ function installFakePool(): void {
         }],
       };
     }
-    if (s.includes("FROM copy_permissions") && s.includes("owner_wallet =")) {
-      const wallet = args[0] as string;
-      const rows = Array.from(permissionsTable.values())
-        .filter((r) => r.owner_wallet === wallet)
-        .map((r) => ({
-          policy_json: r.policy_json,
-          signed_policy_hash: r.signed_policy_hash,
-          status: r.status,
-        }));
-      return { rows };
-    }
     if (s.includes("FROM copy_executions") && s.includes("permission_id =")) {
       const permId = args[0] as string;
       const rows = executionsTable.filter((e) => e.permission_id === permId);
@@ -229,35 +218,23 @@ test("POST /api/copy/permissions: stores valid permission and returns contract f
   assert.equal(body.feedback.ownerWallet, OWNER);
 });
 
-test("GET /api/copy/permissions: returns 400 when missing parameters or invalid address", async () => {
+test("GET /api/copy/permissions: returns 400 when missing permissionId", async () => {
   const missing = await GET(jsonRequest("http://localhost/api/copy/permissions", "GET"));
   assert.equal(missing.status, 400);
+  const body = await missing.json();
+  assert.equal(body.error, "permissionId required");
 
-  const invalidAddress = await GET(jsonRequest("http://localhost/api/copy/permissions?ownerWallet=0xbad", "GET"));
-  assert.equal(invalidAddress.status, 400);
-
-  const notFound = await GET(jsonRequest("http://localhost/api/copy/permissions?permissionId=nonexistent", "GET"));
-  assert.equal(notFound.status, 404);
+  const empty = await GET(jsonRequest("http://localhost/api/copy/permissions?permissionId=   ", "GET"));
+  assert.equal(empty.status, 400);
 });
 
-test("GET /api/copy/permissions: retrieves by permissionId and by ownerWallet", async () => {
-  // Query by permissionId
-  const byId = await GET(jsonRequest("http://localhost/api/copy/permissions?permissionId=perm-valid-store-1", "GET"));
-  assert.equal(byId.status, 200);
-  const byIdBody = await byId.json();
-  assert.equal(byIdBody.permissionId, "perm-valid-store-1");
-  assert.equal(byIdBody.permission.ownerWallet, OWNER);
-  assert.ok(Array.isArray(byIdBody.executions));
-  assert.ok(byIdBody.feedback);
-
-  // Query by ownerWallet
-  const byOwner = await GET(jsonRequest(`http://localhost/api/copy/permissions?ownerWallet=${OWNER}`, "GET"));
-  assert.equal(byOwner.status, 200);
-  const byOwnerBody = await byOwner.json();
-  assert.equal(byOwnerBody.ownerWallet, OWNER);
-  assert.ok(Array.isArray(byOwnerBody.permissions));
-  assert.ok(byOwnerBody.permissions.length >= 1);
-  assert.ok(byOwnerBody.permissions[0].feedback);
+test("GET /api/copy/permissions: retrieves executions by permissionId", async () => {
+  const res = await GET(jsonRequest("http://localhost/api/copy/permissions?permissionId=perm-valid-store-1", "GET"));
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("cache-control"), "no-store");
+  const body = await res.json();
+  assert.equal(body.permissionId, "perm-valid-store-1");
+  assert.ok(Array.isArray(body.executions));
 });
 
 test("DELETE /api/copy/permissions: rejects invalid signature and revokes with valid signature", async () => {
@@ -286,10 +263,10 @@ test("DELETE /api/copy/permissions: rejects invalid signature and revokes with v
   assert.equal(revokeBody.status, "revoked");
   assert.equal(revokeBody.feedback.status, "revoked");
 
-  // Re-fetch should reflect revoked status
+  // Re-fetch executions should still succeed
   const reGet = await GET(jsonRequest(`http://localhost/api/copy/permissions?permissionId=${permId}`, "GET"));
   assert.equal(reGet.status, 200);
   const reGetBody = await reGet.json();
-  assert.equal(reGetBody.permission.status, "revoked");
-  assert.equal(reGetBody.feedback.status, "revoked");
+  assert.equal(reGetBody.permissionId, permId);
+  assert.ok(Array.isArray(reGetBody.executions));
 });

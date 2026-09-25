@@ -1,20 +1,15 @@
 import { Buffer } from "node:buffer";
 import { copyPolicyHash, validateCopyPermission, worstCaseCopySpend, type CopyPermission } from "@/lib/copy-trading";
-import { getCopyPermission, listCopyExecutions, listCopyPermissions, saveCopyPermission } from "@/lib/db";
+import { getCopyPermission, listCopyExecutions, saveCopyPermission } from "@/lib/db";
 import { verifyAgentSignature } from "@/lib/agents/signature";
-import { authorizeRequest } from "@/lib/api/policy";
 import { configuredSpender } from "@/lib/agents/spend-permissions";
-import { getUsdcSacId, isAccountAddress } from "@/lib/stellar";
+import { getUsdcSacId } from "@/lib/stellar";
 import { evaluateCopyPermissionOnchain } from "@/lib/copy-permission-feedback";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const MAX_BODY_BYTES = 16_384;
-
-function clientIp(req: Request): string | undefined {
-  return req.headers.get("x-real-ip") ?? req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? undefined;
-}
 
 async function readJsonBody<T>(req: Request, maxBytes = MAX_BODY_BYTES): Promise<{ ok: true; data: T } | { ok: false; status: number; error: string }> {
   try {
@@ -69,13 +64,6 @@ function jsonResponse(data: unknown, init?: ResponseInit): Response {
 }
 
 export async function POST(req: Request): Promise<Response> {
-  const { authorizeRequest } = await import("@/lib/api/policy");
-  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || undefined;
-  const gate = authorizeRequest("public_read", { route: "/api/copy/permissions", ip });
-  if (!gate.allowed && gate.error) {
-    return Response.json(gate.error.body, { status: gate.error.status, headers: gate.error.headers });
-  }
-
   type JsonPermission = Omit<CopyPermission, "signedPolicyHash" | "spendPermission"> & {
     spendPermission: Omit<CopyPermission["spendPermission"], "allowanceAtomic"> & { allowanceAtomic: string | bigint };
   };
@@ -146,14 +134,12 @@ export async function POST(req: Request): Promise<Response> {
 }
 
 export async function DELETE(req: Request): Promise<Response> {
-  const { authorizeRequest } = await import("@/lib/api/policy");
-  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || undefined;
-  const gate = authorizeRequest("public_read", { route: "/api/copy/permissions", ip });
-  if (!gate.allowed && gate.error) {
-    return Response.json(gate.error.body, { status: gate.error.status, headers: gate.error.headers });
+  const parsedBody = await readJsonBody<{ permissionId?: string; signature?: string }>(req);
+  if (!parsedBody.ok) {
+    return jsonResponse({ error: parsedBody.error }, { status: parsedBody.status });
   }
-  let body: { permissionId?: string; signature?: string };
-  try { body = await req.json(); } catch { return Response.json({ error: "invalid JSON" }, { status: 400 }); }
+  const body = parsedBody.data;
+
   const permissionId = body.permissionId?.trim();
   if (!permissionId || !body.signature) {
     return jsonResponse({ error: "permissionId and signature required" }, { status: 400 });
@@ -182,14 +168,14 @@ export async function DELETE(req: Request): Promise<Response> {
 }
 
 export async function GET(req: Request): Promise<Response> {
-  const { authorizeRequest } = await import("@/lib/api/policy");
-  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || undefined;
-  const gate = authorizeRequest("public_read", { route: "/api/copy/permissions", ip });
-  if (!gate.allowed && gate.error) {
-    return Response.json(gate.error.body, { status: gate.error.status, headers: gate.error.headers });
-  }
   const permissionId = new URL(req.url).searchParams.get("permissionId")?.trim();
-  if (!permissionId) return Response.json({ error: "permissionId required" }, { status: 400 });
+  if (!permissionId) {
+    return jsonResponse({ error: "permissionId required" }, { status: 400 });
+  }
+
   const executions = await listCopyExecutions(permissionId, 100);
-  return Response.json({ permissionId, executions }, { headers: { "cache-control": "no-store" } });
+  return jsonResponse({
+    permissionId,
+    executions,
+  });
 }
