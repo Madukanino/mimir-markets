@@ -215,16 +215,6 @@ test("negative: malformed or credential-leaking citations are excluded from rece
   assert.equal(view.citations.length, 0);
 });
 
-test("paused: paused state produces paused status without revealing receipt fields", () => {
-  const view = buildSettlementReceipt({
-    vs: makeVs(),
-    paused: true,
-  });
-  assert.equal(view.status, "paused");
-  assert.equal(view.claimId, 58);
-  assert.equal(settlementReceiptShowsFields(view), false);
-});
-
 test("dependency_failure: invalid claimId produces dependency_failure", () => {
   const view = buildSettlementReceipt({
     vs: makeVs({ id: -1 }),

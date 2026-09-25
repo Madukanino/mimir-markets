@@ -21,7 +21,6 @@ export type SettlementReceiptStatus =
   | "stale"
   | "disconnected"
   | "dependency_failure"
-  | "paused"
   | "ready";
 
 export type SettlementOutcomeKey =
@@ -43,8 +42,6 @@ export interface SettlementReceiptInput {
    * is live on-chain even if a cached `vs` is present.
    */
   disconnected?: boolean;
-  /** Optional pause state — when true, signals settlement operations are paused. */
-  paused?: boolean;
   /** Optional research citations backing the verdict or settlement receipt. */
   citations?: ResearchCitation[];
 }
@@ -149,20 +146,11 @@ export function buildSettlementReceipt(
     freshness = null,
     loading = false,
     disconnected = false,
-    paused = false,
     citations: inputCitations,
   } = input;
 
   if (loading && !vs) {
     return emptyView("loading", {
-      freshnessStatus: freshness?.status ?? null,
-    });
-  }
-
-  if (paused) {
-    return emptyView("paused", {
-      claimId: typeof vs?.id === "number" ? vs.id : null,
-      marketState: vs?.state ?? null,
       freshnessStatus: freshness?.status ?? null,
     });
   }

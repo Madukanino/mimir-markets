@@ -34,7 +34,6 @@ const STATUS_CLASSES: Record<SettlementReceiptView["status"], string> = {
   stale: "border-pv-danger/35 bg-pv-danger/[0.08] text-pv-danger",
   disconnected: "border-amber-400/35 bg-amber-400/[0.10] text-amber-300",
   dependency_failure: "border-amber-400/35 bg-amber-400/[0.10] text-amber-300",
-  paused: "border-amber-400/35 bg-amber-400/[0.10] text-amber-300",
   ready: "border-pv-emerald/30 bg-pv-emerald/[0.08] text-pv-emerald",
 };
 
