@@ -69,9 +69,11 @@ function jsonResponse(data: unknown, init?: ResponseInit): Response {
 }
 
 export async function POST(req: Request): Promise<Response> {
-  const gate = authorizeRequest("public_read", { route: "/api/copy/permissions", ip: clientIp(req) });
+  const { authorizeRequest } = await import("@/lib/api/policy");
+  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || undefined;
+  const gate = authorizeRequest("public_read", { route: "/api/copy/permissions", ip });
   if (!gate.allowed && gate.error) {
-    return jsonResponse(gate.error.body, { status: gate.error.status, headers: gate.error.headers });
+    return Response.json(gate.error.body, { status: gate.error.status, headers: gate.error.headers });
   }
 
   type JsonPermission = Omit<CopyPermission, "signedPolicyHash" | "spendPermission"> & {
@@ -144,17 +146,14 @@ export async function POST(req: Request): Promise<Response> {
 }
 
 export async function DELETE(req: Request): Promise<Response> {
-  const gate = authorizeRequest("public_read", { route: "/api/copy/permissions", ip: clientIp(req) });
+  const { authorizeRequest } = await import("@/lib/api/policy");
+  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || undefined;
+  const gate = authorizeRequest("public_read", { route: "/api/copy/permissions", ip });
   if (!gate.allowed && gate.error) {
-    return jsonResponse(gate.error.body, { status: gate.error.status, headers: gate.error.headers });
+    return Response.json(gate.error.body, { status: gate.error.status, headers: gate.error.headers });
   }
-
-  const parsedBody = await readJsonBody<{ permissionId?: string; signature?: string }>(req);
-  if (!parsedBody.ok) {
-    return jsonResponse({ error: parsedBody.error }, { status: parsedBody.status });
-  }
-  const body = parsedBody.data;
-
+  let body: { permissionId?: string; signature?: string };
+  try { body = await req.json(); } catch { return Response.json({ error: "invalid JSON" }, { status: 400 }); }
   const permissionId = body.permissionId?.trim();
   if (!permissionId || !body.signature) {
     return jsonResponse({ error: "permissionId and signature required" }, { status: 400 });
@@ -183,48 +182,14 @@ export async function DELETE(req: Request): Promise<Response> {
 }
 
 export async function GET(req: Request): Promise<Response> {
-  const gate = authorizeRequest("public_read", { route: "/api/copy/permissions", ip: clientIp(req) });
+  const { authorizeRequest } = await import("@/lib/api/policy");
+  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || undefined;
+  const gate = authorizeRequest("public_read", { route: "/api/copy/permissions", ip });
   if (!gate.allowed && gate.error) {
-    return jsonResponse(gate.error.body, { status: gate.error.status, headers: gate.error.headers });
+    return Response.json(gate.error.body, { status: gate.error.status, headers: gate.error.headers });
   }
-
-  const url = new URL(req.url);
-  const permissionId = url.searchParams.get("permissionId")?.trim();
-  const ownerWallet = url.searchParams.get("ownerWallet")?.trim();
-
-  if (permissionId) {
-    const permission = await getCopyPermission(permissionId);
-    if (!permission) {
-      return jsonResponse({ error: "permission not found" }, { status: 404 });
-    }
-    const [executions, feedback] = await Promise.all([
-      listCopyExecutions(permissionId, 100),
-      evaluateCopyPermissionOnchain(permission),
-    ]);
-    return jsonResponse({
-      permissionId,
-      permission,
-      executions,
-      feedback,
-    });
-  }
-
-  if (ownerWallet) {
-    if (!isAccountAddress(ownerWallet)) {
-      return jsonResponse({ error: "invalid ownerWallet address" }, { status: 400 });
-    }
-    const permissions = await listCopyPermissions(ownerWallet, 50);
-    const withFeedback = await Promise.all(
-      permissions.map(async (perm) => {
-        const feedback = await evaluateCopyPermissionOnchain(perm);
-        return { ...perm, feedback };
-      }),
-    );
-    return jsonResponse({
-      ownerWallet,
-      permissions: withFeedback,
-    });
-  }
-
-  return jsonResponse({ error: "permissionId or ownerWallet required" }, { status: 400 });
+  const permissionId = new URL(req.url).searchParams.get("permissionId")?.trim();
+  if (!permissionId) return Response.json({ error: "permissionId required" }, { status: 400 });
+  const executions = await listCopyExecutions(permissionId, 100);
+  return Response.json({ permissionId, executions }, { headers: { "cache-control": "no-store" } });
 }
