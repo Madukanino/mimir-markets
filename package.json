@@ -38,6 +38,7 @@
     "deploy:contract": "tsx --env-file-if-exists=.env.local deploy/deploy.ts",
     "verify:deployment": "tsx --env-file-if-exists=.env.local scripts/verify-deployment.ts",
     "verify:artifacts": "tsx scripts/verify-artifact-provenance.ts",
+    "verify:status": "tsx scripts/verify-operational-status.ts",
     "verify:analytics": "tsx scripts/check-analytics-gates.ts",
     "smoke:x402": "tsx --env-file-if-exists=.env.local scripts/x402-stellar-smoke.ts",
     "smoke:x402:http": "tsx --env-file-if-exists=.env.local scripts/x402-http-smoke.ts",

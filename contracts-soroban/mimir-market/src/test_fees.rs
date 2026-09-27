@@ -244,7 +244,9 @@ fn changing_the_platform_recipient_cannot_redirect_an_existing_claim() {
     let f = Fixture::new(1_000, 0);
     let creator = f.user(100 * USDC);
     let c1 = f.user(100 * USDC);
-    let id = f.client().create_claim(&creator, &f.params(10 * USDC));
+    let mut params = f.params(10 * USDC);
+    params.deadline = f.env.ledger().timestamp() + FEE_TIMELOCK_SECONDS + 3_600;
+    let id = f.client().create_claim(&creator, &params);
     assert_eq!(
         f.client().get_claim_fees(&id).platform_recipient,
         Some(f.platform.clone())

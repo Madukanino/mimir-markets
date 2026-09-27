@@ -921,6 +921,29 @@ npm run smoke:browser -- --filter boot       # run only the boot spec
 
 **Failure, rollback and artifacts.** On failure the run prints where to look, restores the moved `.env*` files and kills the server, and CI uploads `playwright-report/` + `test-results/` for 7 days. Every mode of the runner tears down cleanly, so a developer can always rerun exactly what CI ran with one command: `npm run smoke:browser`.
 
+### Public operational status surface
+
+Mimir exposes a public, unauthenticated, privacy-safe operational status endpoint at `/api/health/status` (and an operational status reference on `/api/health`). It provides unified telemetry on deployment state, artifact provenance, capability pause flags, and health alarms without requiring production secrets.
+
+**Core guarantees:**
+- **Chain-first accounting:** Soroban contracts and Stellar ledgers are authoritative for all funds and settlements. The Postgres database is an idempotent read-index projection.
+- **Fail-closed posture:** Missing database configuration, missing contract StrKeys in release mode, or unpinned/corrupted artifact digests elevate the status to `critical` and return HTTP 503, preventing silent bypass of money or deployment controls.
+- **Invariant protection:** In accordance with non-custodial principles, withdrawals (`withdraw`) and audit/read paths (`read_markets`, `read_reasoning`) are strictly non-pausable (`invariant_never_pausable`) under all conditions, even if `MIMIR_PAUSE_ALL=1` or `MIMIR_PAUSE_WITHDRAW=1` is set.
+- **Privacy safety:** Zero secrets (`S…` seeds, database passwords, API tokens, user PII) are ever returned.
+- **Clean checkout verification:** Verifiable offline or in CI from a fresh clone without environment secrets:
+
+```bash
+npm run verify:status                         # default develop mode verification
+npm run verify:status -- --mode=release       # release mode: enforces contracts & pinned artifacts
+npm run verify:status -- --strict             # warnings treated as failures
+npm run verify:status -- --json               # machine-readable JSON output
+```
+
+**Failure and rollback guidance:**
+- *Database unconfigured / alarms:* Inspect `report.health.alarms`. Database failure triggers HTTP 503 while preserving read-only static surfaces and on-chain Soroban withdrawal accessibility.
+- *Artifact digest mismatch:* If `verify:artifacts` or `verify:status` flags unpinned or mismatched Wasm digests, verify git tags and rebuild deterministic Wasm via `cargo build --target wasm32-unknown-unknown --release`.
+- *Capability mitigation:* During incidents, individual capabilities (e.g. `MIMIR_PAUSE_STAKE=1`, `MIMIR_PAUSE_COPY_EXECUTION=1`, `MIMIR_PAUSE_RESEARCH=1`) or global actions (`MIMIR_PAUSE_ALL=1`) can be toggled via environment variables without redeploying code. Withdrawals remain unaffected.
+
 ---
 
 ## End-to-end demo
@@ -1107,6 +1130,7 @@ Every env var lives in `.env.example`. Quick reference:
 | `npm run deploy:contract`                    | Build, deploy and initialize the Soroban contracts on Stellar Testnet              |
 | `npm run verify:deployment`                  | Check the deployed contract ids, WASM hash and initialized config                  |
 | `npm run verify:artifacts`                   | Verify / pin Soroban Wasm digests against `deploy/contract-artifacts.manifest.json` (no secrets) |
+| `npm run verify:status`                      | Verify public operational status surface, fail-closed contracts, and invariants     |
 | `npm run verify:analytics`                   | Check the analytics gates the launch gate requires                                 |
 | `npm run smoke:onchain`                      | On-chain smoke test against the live deployment (`:full` adds resolve + squad)     |
 | `npm run smoke:x402` / `:http`               | Payment-scheme smoke against live Testnet / a full HTTP round trip                 |
