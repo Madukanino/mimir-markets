@@ -74,14 +74,14 @@ test("positive: fully configured deployment reports ready and valid contract for
   assert.equal(deployment.fundedFeaturesReady, true);
 });
 
-test("positive: reports all 9 pausable capabilities and 3 non-pausable invariants", () => {
+test("positive: reports all 10 pausable capabilities and 3 non-pausable invariants", () => {
   const caps = evaluateCapabilitiesStatus({});
   assert.equal(caps.globalPause, false);
 
   const pausableItems = caps.items.filter((i) => i.type === "pausable");
   const invariantItems = caps.items.filter((i) => i.type === "invariant_never_pausable");
 
-  assert.equal(pausableItems.length, 9);
+  assert.equal(pausableItems.length, 10);
   assert.equal(invariantItems.length, 3);
 
   const withdraw = caps.items.find((i) => i.capability === "withdraw");
