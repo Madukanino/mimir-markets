@@ -244,6 +244,9 @@ fn changing_the_platform_recipient_cannot_redirect_an_existing_claim() {
     let f = Fixture::new(1_000, 0);
     let creator = f.user(100 * USDC);
     let c1 = f.user(100 * USDC);
+    // The fee timelock is two days, so the claim's deadline has to outlive the
+    // queue/execute cycle below: the challenge afterwards must still land
+    // inside the claim's challenge window.
     let mut params = f.params(10 * USDC);
     params.deadline = f.env.ledger().timestamp() + FEE_TIMELOCK_SECONDS + 3_600;
     let id = f.client().create_claim(&creator, &params);
