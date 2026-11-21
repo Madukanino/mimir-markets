@@ -360,6 +360,18 @@ npm run workers
 | `TRADER_QUANT_PUBLIC` | _(derived)_ | Stellar public key (`G…`) for the Quant Thresholder persona. Derived from secret key by wallet tooling. |
 | `GROQ_API_KEY` | _(none)_ | Groq API key used for trader LLM inference (`agents/traders/index.ts` sets `LLM_PROVIDER = "groq"`). |
 
+| `TRADER_JOURNAL_CAPACITY` | `200` | Maximum capacity of the bounded in-memory trader decision journal before FIFO eviction. |
+
+### Trader decision journal
+
+Trader decision logic is implemented in [`agents/traders/policy.ts`](../agents/traders/policy.ts) with a bounded in-memory journal (`TraderDecisionJournal`). The journal coordinates with sequence reservations from [`lib/agents/sequence-manager.ts`](../lib/agents/sequence-manager.ts) to track autonomous staking evaluations within exact spending limits.
+
+Key characteristics:
+- **Bounded Capacity**: Retains up to `TRADER_JOURNAL_CAPACITY` (default: 200) decision entries using FIFO eviction.
+- **Deterministic Digests**: Computes and stores canonical SHA-256 digests for market signals (`signalDigest`), policy revisions (`policyRevisionDigest`), and disposition outcomes (`dispositionDigest`).
+- **Privacy & Safety Guarantees**: Strictly excludes full private model prompts (templates, persona prompt strategies) and fails closed if signing material (Stellar secret seeds `S…`, private keys) is detected.
+- **Sequence Coordination**: Captures and updates account sequence reservation snapshots (`SequenceReservationSnapshot`) to audit transactions and avoid duplicate or out-of-order sequence usage.
+
 ## Demo seed claims
 
 Preview the fixed demo claim set without a signer, contract id, or network access:
