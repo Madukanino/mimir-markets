@@ -114,6 +114,7 @@ export type ResearchContentState =
   | "stale"
   | "duplicated"
   | "cancelled"
+  | "interrupted"
   | "dependency_failure"
   | "invalid";
 
@@ -183,6 +184,11 @@ export interface ContentValidationOpts {
    * completed. Marks the result as `cancelled`.
    */
   cancelled?: boolean;
+  /**
+   * True if the fetch attempt was interrupted prior to settlement (e.g. worker restart).
+   * Marks the result as `interrupted`.
+   */
+  interrupted?: boolean;
   /**
    * True if a sibling fetch in the same context pack failed. Marks the result as
    * `dependency_failure` unless the primary content itself is invalid.
@@ -363,12 +369,21 @@ export function validateResearchContent(
       );
     }
 
-    // ── 2. Lifecycle state checks (order: cancelled > dependency > stale > dup) ─
+    // ── 2. Lifecycle state checks (order: cancelled > interrupted > dependency > stale > dup) ─
 
     if (opts.cancelled) {
       return toResult(
         "cancelled",
         "the requesting agent or market was cancelled; this content must not be used for settlement",
+        [],
+        false,
+      );
+    }
+
+    if (opts.interrupted) {
+      return toResult(
+        "interrupted",
+        "fetch attempt was interrupted prior to settlement; this content must not be used for settlement",
         [],
         false,
       );

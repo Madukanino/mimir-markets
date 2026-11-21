@@ -18,9 +18,6 @@
  * re-validate each hop, which `fetch`'s automatic following makes impossible.
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { sha256Hex } from "@/lib/content-hash";
 import { isPaused } from "@/lib/ops/flags";
@@ -93,390 +90,57 @@ export type FetchResult =
   | ({ ok: true } & FetchSuccess)
   | ({ ok: false } & FetchFailure);
 
-// ── Per-agent budget & reservations ──────────────────────────────────────────
+// ── Per-agent budget ──────────────────────────────────────────────────────────
 
 export interface AgentBudget {
   /** Requests this agent may make in the current window. */
   maxRequests: number;
   /** Bytes this agent may download in the current window. */
   maxBytes: number;
-  /** Maximum paid-fetch units (USDC atomic integers) this agent may spend in current window. */
-  maxPaidUnits?: number;
   /** Window duration in milliseconds. Defaults to 1 hour (3_600_000 ms). */
   windowMs?: number;
 }
 
-export type ReservationStatus = "reserved" | "committed" | "released" | "interrupted";
-
-export interface BudgetReservation {
-  id: string;
-  agentId: string;
-  requests: number;
-  paidUnits: number;
-  createdAt: number;
-  status: ReservationStatus;
-  url?: string;
-  stateDir?: string;
-}
-
-export interface BudgetUsage {
+interface BudgetUsage {
   requests: number;
   bytes: number;
-  paidUnits: number;
   windowStartedAt: number;
-}
-
-export interface ReserveBudgetArgs {
-  agentId: string;
-  requests?: number;
-  paidUnits?: number;
-  budget?: AgentBudget;
-  now?: number;
-  url?: string;
-  stateDir?: string;
-}
-
-export type ReserveBudgetResult =
-  | { ok: true; reservation: BudgetReservation }
-  | { ok: false; kind: "budget"; detail: string };
-
-export interface ReconcileResult {
-  reconciledCount: number;
-  releasedRequests: number;
-  releasedPaidUnits: number;
-  interruptedReservations: BudgetReservation[];
 }
 
 const BUDGET_WINDOW_MS = 60 * 60 * 1000;
 const usage = new Map<string, BudgetUsage>();
-const reservations = new Map<string, BudgetReservation>();
 
 export function defaultAgentBudget(): AgentBudget {
   return {
     maxRequests: Number(process.env.RESEARCH_MAX_REQUESTS_PER_AGENT ?? 120),
     maxBytes: Number(process.env.RESEARCH_MAX_BYTES_PER_AGENT ?? 8 * 1024 * 1024),
-    maxPaidUnits: Number(process.env.RESEARCH_MAX_PAID_FETCH_UNITS_PER_AGENT ?? 100_000),
   };
 }
 
-function getStateFilePath(stateDir?: string): string | null {
-  const dir = stateDir?.trim() || process.env.RESEARCH_STATE_DIR?.trim();
-  if (!dir) return null;
-  return join(dir, "budget-state.json");
-}
-
-function loadFromDisk(filePath: string): void {
-  try {
-    if (!existsSync(filePath)) return;
-    const raw = readFileSync(filePath, "utf8");
-    const data = JSON.parse(raw);
-    if (data && typeof data === "object") {
-      if (data.usage && typeof data.usage === "object") {
-        for (const [k, v] of Object.entries(data.usage)) {
-          const val = v as any;
-          usage.set(k, {
-            requests: Number(val.requests) || 0,
-            bytes: Number(val.bytes) || 0,
-            paidUnits: Number(val.paidUnits) || 0,
-            windowStartedAt: Number(val.windowStartedAt) || 0,
-          });
-        }
-      }
-      if (data.reservations && typeof data.reservations === "object") {
-        for (const [k, v] of Object.entries(data.reservations)) {
-          const val = v as any;
-          reservations.set(k, {
-            id: String(val.id || k),
-            agentId: String(val.agentId),
-            requests: Number(val.requests) || 0,
-            paidUnits: Number(val.paidUnits) || 0,
-            createdAt: Number(val.createdAt) || 0,
-            status: val.status as ReservationStatus,
-            url: val.url ? String(val.url) : undefined,
-            stateDir: val.stateDir ? String(val.stateDir) : undefined,
-          });
-        }
-      }
-    }
-  } catch {
-    // If state cannot be read or is corrupted, fail-safe without throwing
-  }
-}
-
-function saveToDisk(filePath: string): void {
-  try {
-    mkdirSync(dirname(filePath), { recursive: true });
-    const payload = {
-      version: 1,
-      usage: Object.fromEntries(usage.entries()),
-      reservations: Object.fromEntries(reservations.entries()),
-    };
-    writeFileSync(filePath, JSON.stringify(payload, null, 2), "utf8");
-  } catch {
-    // Fail-safe without throwing
-  }
-}
-
-function getAgentUsage(
-  agentId: string,
-  now: number,
-  windowMs: number,
-  statePath: string | null,
-): BudgetUsage {
-  if (statePath) {
-    loadFromDisk(statePath);
-  }
+function currentUsage(agentId: string, now: number, windowMs = BUDGET_WINDOW_MS): BudgetUsage {
   const existing = usage.get(agentId);
   if (!existing || now - existing.windowStartedAt >= windowMs) {
-    const fresh: BudgetUsage = { requests: 0, bytes: 0, paidUnits: 0, windowStartedAt: now };
+    const fresh = { requests: 0, bytes: 0, windowStartedAt: now };
     usage.set(agentId, fresh);
-    if (statePath) {
-      saveToDisk(statePath);
-    }
     return fresh;
   }
   return existing;
 }
 
-function getActiveReservations(
-  agentId: string,
-  now: number,
-  windowMs: number,
-  statePath: string | null,
-): { reservedRequests: number; reservedPaidUnits: number } {
-  if (statePath) {
-    loadFromDisk(statePath);
-  }
-  let reservedRequests = 0;
-  let reservedPaidUnits = 0;
-  for (const res of reservations.values()) {
-    if (
-      res.agentId === agentId &&
-      res.status === "reserved" &&
-      now - res.createdAt < windowMs
-    ) {
-      reservedRequests += res.requests;
-      reservedPaidUnits += res.paidUnits;
-    }
-  }
-  return { reservedRequests, reservedPaidUnits };
-}
-
 /** Remaining allowance, for the agent-facing status endpoint. */
-export function budgetRemaining(
-  agentId: string,
-  budget: AgentBudget = defaultAgentBudget(),
-  now: number = Date.now(),
-  stateDir?: string,
-) {
+export function budgetRemaining(agentId: string, budget = defaultAgentBudget(), now = Date.now()) {
   const windowMs = budget.windowMs ?? BUDGET_WINDOW_MS;
-  const statePath = getStateFilePath(stateDir);
-  const used = getAgentUsage(agentId, now, windowMs, statePath);
-  const { reservedRequests, reservedPaidUnits } = getActiveReservations(
-    agentId,
-    now,
-    windowMs,
-    statePath,
-  );
-
-  const maxPaid =
-    budget.maxPaidUnits ?? defaultAgentBudget().maxPaidUnits ?? 100_000;
-
+  const used = currentUsage(agentId, now, windowMs);
   return {
-    requests: Math.max(0, budget.maxRequests - (used.requests + reservedRequests)),
+    requests: Math.max(0, budget.maxRequests - used.requests),
     bytes: Math.max(0, budget.maxBytes - used.bytes),
-    paidUnits: Math.max(0, maxPaid - (used.paidUnits + reservedPaidUnits)),
-    reservedRequests,
-    reservedPaidUnits,
     windowResetsAt: used.windowStartedAt + windowMs,
   };
 }
 
-/**
- * Reserve bounded request and paid-fetch units prior to dispatching network requests.
- */
-export function reserveBudget(args: ReserveBudgetArgs): ReserveBudgetResult {
-  const now = args.now ?? Date.now();
-  const budget = args.budget ?? defaultAgentBudget();
-  const windowMs = budget.windowMs ?? BUDGET_WINDOW_MS;
-  const statePath = getStateFilePath(args.stateDir);
-  const used = getAgentUsage(args.agentId, now, windowMs, statePath);
-  const { reservedRequests, reservedPaidUnits } = getActiveReservations(
-    args.agentId,
-    now,
-    windowMs,
-    statePath,
-  );
-
-  const requestsToReserve = args.requests ?? 1;
-  const paidUnitsToReserve = Math.max(0, args.paidUnits ?? 0);
-  const maxPaid =
-    budget.maxPaidUnits ?? defaultAgentBudget().maxPaidUnits ?? 100_000;
-
-  if (used.requests + reservedRequests + requestsToReserve > budget.maxRequests) {
-    return {
-      ok: false,
-      kind: "budget",
-      detail: `agent '${args.agentId}' exhausted request budget (${budget.maxRequests})`,
-    };
-  }
-
-  if (used.paidUnits + reservedPaidUnits + paidUnitsToReserve > maxPaid) {
-    return {
-      ok: false,
-      kind: "budget",
-      detail: `agent '${args.agentId}' exhausted paid-fetch unit budget (${maxPaid})`,
-    };
-  }
-
-  const reservation: BudgetReservation = {
-    id: randomUUID(),
-    agentId: args.agentId,
-    requests: requestsToReserve,
-    paidUnits: paidUnitsToReserve,
-    createdAt: now,
-    status: "reserved",
-    url: args.url,
-    stateDir: args.stateDir,
-  };
-
-  reservations.set(reservation.id, reservation);
-  if (statePath) {
-    saveToDisk(statePath);
-  }
-
-  return { ok: true, reservation };
-}
-
-/**
- * Commit a pending reservation upon successful fetch completion.
- * Updates actual usage and marks reservation committed.
- */
-export function commitReservation(
-  reservationId: string,
-  opts?: {
-    bytes?: number;
-    paidUnits?: number;
-    stateDir?: string;
-    now?: number;
-  },
-): boolean {
-  const reservation = reservations.get(reservationId);
-  const targetDir = opts?.stateDir ?? reservation?.stateDir;
-  const statePath = getStateFilePath(targetDir);
-  if (statePath && !reservation) {
-    loadFromDisk(statePath);
-  }
-  const target = reservations.get(reservationId);
-  if (!target || target.status !== "reserved") {
-    return false;
-  }
-
-  target.status = "committed";
-  const now = opts?.now ?? target.createdAt;
-  const existing = usage.get(target.agentId);
-  const actualPaidUnits =
-    opts?.paidUnits !== undefined ? opts.paidUnits : target.paidUnits;
-  const actualBytes = opts?.bytes ?? 0;
-
-  if (existing) {
-    existing.requests += target.requests;
-    existing.paidUnits += actualPaidUnits;
-    existing.bytes += actualBytes;
-  } else {
-    usage.set(target.agentId, {
-      requests: target.requests,
-      paidUnits: actualPaidUnits,
-      bytes: actualBytes,
-      windowStartedAt: now,
-    });
-  }
-
-  if (statePath) {
-    saveToDisk(statePath);
-  }
-  return true;
-}
-
-/**
- * Release a pending reservation without charging the agent's budget (e.g. on blocked request).
- */
-export function releaseReservation(
-  reservationId: string,
-  stateDir?: string,
-): boolean {
-  const reservation = reservations.get(reservationId);
-  const targetDir = stateDir ?? reservation?.stateDir;
-  const statePath = getStateFilePath(targetDir);
-  if (statePath && !reservation) {
-    loadFromDisk(statePath);
-  }
-  const target = reservations.get(reservationId);
-  if (!target || target.status !== "reserved") {
-    return false;
-  }
-
-  target.status = "released";
-  if (statePath) {
-    saveToDisk(statePath);
-  }
-  return true;
-}
-
-/**
- * Reconcile interrupted in-flight attempts across worker restarts.
- * Releases held reservations without resetting an agent's authorized budget or committed usage.
- */
-export function reconcileInterruptedAttempts(opts?: {
-  stateDir?: string;
-  now?: number;
-}): ReconcileResult {
-  const statePath = getStateFilePath(opts?.stateDir);
-  if (statePath) {
-    loadFromDisk(statePath);
-  }
-
-  let reconciledCount = 0;
-  let releasedRequests = 0;
-  let releasedPaidUnits = 0;
-  const interruptedReservations: BudgetReservation[] = [];
-
-  for (const reservation of reservations.values()) {
-    if (reservation.status === "reserved") {
-      reservation.status = "interrupted";
-      reconciledCount++;
-      releasedRequests += reservation.requests;
-      releasedPaidUnits += reservation.paidUnits;
-      interruptedReservations.push(reservation);
-    }
-  }
-
-  if (statePath && reconciledCount > 0) {
-    saveToDisk(statePath);
-  }
-
-  return {
-    reconciledCount,
-    releasedRequests,
-    releasedPaidUnits,
-    interruptedReservations,
-  };
-}
-
-/**
- * Reset budgets in memory. If stateDir is passed, also cleans up persisted state.
- */
-export function resetBudgets(stateDir?: string): void {
+/** Test seam — the budget window is process-local by design. */
+export function resetBudgets(): void {
   usage.clear();
-  reservations.clear();
-  if (stateDir?.trim()) {
-    const filePath = join(stateDir.trim(), "budget-state.json");
-    if (existsSync(filePath)) {
-      try {
-        rmSync(filePath, { force: true });
-      } catch {}
-    }
-  }
 }
 
 // ── Response cache ────────────────────────────────────────────────────────────
@@ -550,6 +214,7 @@ function cacheGet(url: string, now: number, policyRevision: string): FetchSucces
     return null;
   }
   if (entry.policyRevision !== policyRevision) {
+    // Invalidate incompatible cached decisions when validation changes
     cache.delete(normKey);
     cache.delete(url);
     return null;
@@ -568,62 +233,52 @@ function cacheSet(url: string, value: FetchSuccess, policyRevision: string, now:
 
 // ── Validation of one hop ─────────────────────────────────────────────────────
 
-export type HopVerdict =
-  | { allowed: true; url: string }
-  | { allowed: false; reason: SsrfReason; detail: string };
-
 /**
- * Validate one hop in the redirect chain. Exported so unit tests can probe
- * policy evaluation without mocking `fetch`.
+ * Validate a single URL: static checks, operator domain policy, then DNS. Called
+ * for the original URL AND for every redirect target.
  */
 export async function validateHop(
-  rawUrl: string,
+  url: string,
   policy: DomainPolicy,
   resolve: (host: string) => Promise<string[]> = defaultResolve,
-): Promise<HopVerdict> {
-  const urlCheck = checkUrl(rawUrl);
-  if (!urlCheck.allowed) {
-    return { allowed: false, reason: urlCheck.reason, detail: urlCheck.detail };
+): Promise<{ allowed: true } | { allowed: false; reason: SsrfReason; detail: string }> {
+  const staticCheck = checkUrl(url);
+  if (!staticCheck.allowed) {
+    return { allowed: false, reason: staticCheck.reason!, detail: staticCheck.detail! };
   }
-  const { parsed } = urlCheck;
-
-  const domainCheck = checkDomainPolicy(parsed.hostname, policy);
-  if (!domainCheck.allowed) {
-    return { allowed: false, reason: domainCheck.reason, detail: domainCheck.detail };
+  const policyCheck = checkDomainPolicy(url, policy);
+  if (!policyCheck.allowed) {
+    return { allowed: false, reason: policyCheck.reason!, detail: policyCheck.detail! };
   }
 
-  let ips: string[];
+  // DNS last: it is the expensive check, and it is the one that catches a public
+  // hostname pointing at a private address.
+  let addresses: string[];
   try {
-    ips = await resolve(parsed.hostname);
-  } catch (err) {
-    return {
-      allowed: false,
-      reason: "dns_lookup_failed",
-      detail: `DNS lookup failed for '${parsed.hostname}': ${err instanceof Error ? err.message : "unknown error"}`,
-    };
+    addresses = await resolve(new URL(url).hostname);
+  } catch {
+    return { allowed: false, reason: "malformed", detail: "host did not resolve" };
   }
-
-  const ipCheck = checkResolvedAddresses(ips);
-  if (!ipCheck.allowed) {
-    return { allowed: false, reason: ipCheck.reason, detail: ipCheck.detail };
+  const dnsCheck = checkResolvedAddresses(addresses);
+  if (!dnsCheck.allowed) {
+    return { allowed: false, reason: dnsCheck.reason!, detail: dnsCheck.detail! };
   }
-
-  return { allowed: true, url: rawUrl };
+  return { allowed: true };
 }
 
 async function defaultResolve(host: string): Promise<string[]> {
-  const results = await lookup(host, { all: true });
-  return results.map((r) => r.address);
+  const records = await lookup(host, { all: true, verbatim: true });
+  return records.map((record) => record.address);
 }
 
-// ── Gateway fetch ─────────────────────────────────────────────────────────────
+// ── The fetch ─────────────────────────────────────────────────────────────────
 
 export interface GatewayFetchArgs {
   url: string;
+  /** Registry id of the requesting agent, for budget accounting. */
   agentId: string;
   policy?: DomainPolicy;
   budget?: AgentBudget;
-  paidUnits?: number;
   headers?: Record<string, string>;
   signal?: AbortSignal;
   maxRedirects?: number;
@@ -635,7 +290,6 @@ export interface GatewayFetchArgs {
   now?: number;
   /** Content-validation policy revision to bind to this fetch result. */
   policyRevision?: string;
-  stateDir?: string;
 }
 
 function contentTypeAllowed(contentType: string): boolean {
@@ -651,10 +305,7 @@ function normalizeUrlForLoopCheck(raw: string): string {
  * Read a bounded prefix of the body. Streaming with a running total, so a source
  * that lies in Content-Length (or omits it) still cannot blow the limit.
  */
-async function readBounded(
-  response: Response,
-  limit: number,
-): Promise<{ text: string; bytes: number; truncated: boolean }> {
+async function readBounded(response: Response, limit: number): Promise<{ text: string; bytes: number; truncated: boolean }> {
   const reader = response.body?.getReader();
   if (!reader) {
     const text = await response.text();
@@ -699,16 +350,16 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
   };
   const envPolicy = domainPolicyFromEnv();
   const policyDiagnostics = domainPolicyDiagnostics();
+  // The operator's configuration is authoritative: a request-scoped policy may
+  // narrow it but never widen it. Before this, `policy: { allow: [] }` on a
+  // fetch cleared the operator allowlist and admitted the whole internet.
   const policy: DomainPolicy = composeDomainPolicy(envPolicy, args.policy);
-
+  // Request-level redirect switches may only tighten, never loosen.
   if (args.allowCrossDomainRedirects !== undefined) {
-    policy.allowCrossDomainRedirects =
-      (policy.allowCrossDomainRedirects ?? true) && args.allowCrossDomainRedirects;
+    policy.allowCrossDomainRedirects = (policy.allowCrossDomainRedirects ?? true) && args.allowCrossDomainRedirects;
   }
   if (args.allowProtocolDowngrade !== undefined) {
-    policy.disallowProtocolDowngrade =
-      (policy.disallowProtocolDowngrade ?? true) ||
-      args.allowProtocolDowngrade === false;
+    policy.disallowProtocolDowngrade = (policy.disallowProtocolDowngrade ?? true) || args.allowProtocolDowngrade === false;
   }
   const budget = args.budget ?? defaultAgentBudget();
   const doFetch = args.fetchImpl ?? fetch;
@@ -717,6 +368,8 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
     return fail({ kind: "cancelled", detail: "request was cancelled" });
   }
 
+  // A configured-but-unusable allowlist is a configuration error, not license to
+  // fetch anything. Refuse, and make the reason countable in telemetry.
   if (policyDiagnostics.allowConfigured && envPolicy.allow.length === 0 && !policy.denyAll) {
     recordAllowlistReject("pattern_invalid");
     return fail({
@@ -725,26 +378,20 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
       detail: `RESEARCH_ALLOWED_DOMAINS has no usable entries (${policyDiagnostics.allowInvalid.length} invalid); refusing all research fetches`,
     });
   }
-
-  const requireAllowlist = ["1", "true"].includes(
-    (process.env.RESEARCH_REQUIRE_ALLOWLIST ?? "").toLowerCase(),
-  );
+  // Strict mode is the recommended production posture: opt in with
+  // RESEARCH_REQUIRE_ALLOWLIST=1 so "no allowlist configured" is a refusal rather
+  // than an open gateway. Opt-in, so existing deployments keep working.
+  const requireAllowlist = ["1", "true"].includes((process.env.RESEARCH_REQUIRE_ALLOWLIST ?? "").toLowerCase());
   if (requireAllowlist && policy.allow.length === 0 && !policy.denyAll) {
     recordAllowlistReject("allowlist_unconfigured");
     return fail({
       kind: "blocked",
       reason: "not_allowlisted",
-      detail:
-        "RESEARCH_REQUIRE_ALLOWLIST=1 but neither RESEARCH_ALLOWED_DOMAINS nor a request allowlist is set",
+      detail: "RESEARCH_REQUIRE_ALLOWLIST=1 but neither RESEARCH_ALLOWED_DOMAINS nor a request allowlist is set",
     });
   }
 
-  const pausedAgents = new Set(
-    (process.env.RESEARCH_PAUSED_AGENT_IDS ?? "")
-      .split(",")
-      .map((id) => id.trim().toLowerCase())
-      .filter(Boolean),
-  );
+  const pausedAgents = new Set((process.env.RESEARCH_PAUSED_AGENT_IDS ?? "").split(",").map((id) => id.trim().toLowerCase()).filter(Boolean));
   if (isPaused("research") || pausedAgents.has(args.agentId.trim().toLowerCase())) {
     return fail({ kind: "paused", detail: `research is paused for agent '${args.agentId}'` });
   }
@@ -752,28 +399,16 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
   const cached = cacheGet(args.url, now, policyRevision);
   if (cached) return { ok: true, ...cached, fromCache: true };
 
-  // Reserve bounded request and paid-fetch units before dispatch
-  const reserved = reserveBudget({
-    agentId: args.agentId,
-    requests: 1,
-    paidUnits: args.paidUnits ?? 0,
-    budget,
-    now,
-    url: args.url,
-    stateDir: args.stateDir,
-  });
-  if (!reserved.ok) {
+  // Budget is checked BEFORE the request, and charged whether or not the response
+  // is useful — a refused-after-connect request still cost the source a hit.
+  const used = currentUsage(args.agentId, now, budget.windowMs ?? BUDGET_WINDOW_MS);
+  if (used.requests >= budget.maxRequests) {
     return fail({
       kind: "budget",
-      detail: reserved.detail,
+      detail: `agent '${args.agentId}' has used its ${budget.maxRequests} request budget`,
     });
   }
-  const reservationId = reserved.reservation.id;
-
-  const statePath = getStateFilePath(args.stateDir);
-  const used = getAgentUsage(args.agentId, now, budget.windowMs ?? BUDGET_WINDOW_MS, statePath);
   if (used.bytes >= budget.maxBytes) {
-    releaseReservation(reservationId, args.stateDir);
     return fail({
       kind: "budget",
       detail: `agent '${args.agentId}' has used its ${budget.maxBytes} byte budget`,
@@ -790,6 +425,8 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
     ...(args.headers ?? {}),
   };
 
+  // Callers can only lower the redirect ceiling, never raise it past the
+  // operator's policy.
   const requestedMaxRedirects = [args.maxRedirects, policy.maxRedirects].filter(
     (value): value is number => typeof value === "number",
   );
@@ -803,13 +440,11 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
 
   for (;;) {
     if (args.signal?.aborted) {
-      releaseReservation(reservationId, args.stateDir);
       return fail({ kind: "cancelled", detail: "request was cancelled" });
     }
 
     const hop = await validateHop(current, policy, args.resolve);
     if (!hop.allowed) {
-      releaseReservation(reservationId, args.stateDir);
       if (hop.reason === "protocol_downgrade") {
         return fail({ kind: "protocol_downgrade", detail: hop.detail });
       }
@@ -819,6 +454,8 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
       return fail({ kind: "blocked", reason: hop.reason, detail: hop.detail });
     }
 
+    used.requests += 1;
+
     let response: Response;
     try {
       const fetchSignal = args.signal
@@ -826,6 +463,8 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
         : AbortSignal.timeout(REQUEST_TIMEOUT_MS);
 
       response = await doFetch(current, {
+        // Manual, so every hop is re-validated. Automatic following would let a
+        // public page redirect us into the metadata service unchecked.
         redirect: "manual",
         headers: requestHeaders,
         signal: fetchSignal,
@@ -833,16 +472,8 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
       });
     } catch (err) {
       if (args.signal?.aborted || (err instanceof Error && err.name === "AbortError" && args.signal?.aborted)) {
-        releaseReservation(reservationId, args.stateDir);
         return fail({ kind: "cancelled", detail: "request was cancelled" });
       }
-      // Reached the network; commit 1 request, 0 paid units
-      commitReservation(reservationId, {
-        bytes: 0,
-        paidUnits: 0,
-        stateDir: args.stateDir,
-        now,
-      });
       return fail({
         kind: "transport",
         detail: err instanceof Error ? err.message : "fetch failed",
@@ -852,7 +483,6 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("location");
       if (!location || location.trim() === "") {
-        commitReservation(reservationId, { bytes: 0, paidUnits: 0, stateDir: args.stateDir, now });
         return fail({ kind: "invalid_redirect", detail: `redirect response (${response.status}) without a location header` });
       }
 
@@ -860,13 +490,12 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
       try {
         nextUrl = new URL(location.trim(), current).toString();
       } catch {
-        commitReservation(reservationId, { bytes: 0, paidUnits: 0, stateDir: args.stateDir, now });
         return fail({ kind: "invalid_redirect", detail: `unparseable redirect target '${location}'` });
       }
 
+      // Check redirect hop policy (protocol downgrade, cross-domain rules)
       const redirectHopVerdict = checkRedirectHopPolicy(current, nextUrl, policy);
       if (!redirectHopVerdict.allowed) {
-        releaseReservation(reservationId, args.stateDir);
         if (redirectHopVerdict.reason === "protocol_downgrade") {
           return fail({ kind: "protocol_downgrade", detail: redirectHopVerdict.detail ?? "insecure protocol downgrade" });
         }
@@ -876,15 +505,14 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
         return fail({ kind: "blocked", reason: redirectHopVerdict.reason!, detail: redirectHopVerdict.detail! });
       }
 
+      // Check for redirect cycles / duplicate targets
       const normNext = normalizeUrlForLoopCheck(nextUrl);
       if (visitedUrls.has(normNext)) {
-        commitReservation(reservationId, { bytes: 0, paidUnits: 0, stateDir: args.stateDir, now });
         return fail({ kind: "redirect_loop", detail: `redirect cycle or duplicate target detected for '${nextUrl}'` });
       }
 
       redirects += 1;
       if (redirects > effectiveMaxRedirects) {
-        commitReservation(reservationId, { bytes: 0, paidUnits: 0, stateDir: args.stateDir, now });
         return fail({ kind: "too_many_redirects", detail: `more than ${effectiveMaxRedirects} redirects` });
       }
 
@@ -896,29 +524,21 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
     }
 
     if (!response.ok) {
-      commitReservation(reservationId, { bytes: 0, paidUnits: 0, stateDir: args.stateDir, now });
       return fail({ kind: "http_error", status: response.status, detail: `upstream ${response.status}` });
     }
 
     const contentType = response.headers.get("content-type") ?? "";
     if (!contentTypeAllowed(contentType)) {
-      commitReservation(reservationId, { bytes: 0, paidUnits: 0, stateDir: args.stateDir, now });
       return fail({ kind: "content_type", detail: `unsupported content-type '${contentType}'` });
     }
 
     const { text, bytes, truncated } = await readBounded(response, MAX_RESPONSE_BYTES);
+    used.bytes += bytes;
     if (truncated) {
-      commitReservation(reservationId, { bytes, paidUnits: 0, stateDir: args.stateDir, now });
+      // A truncated source is a silent correctness hazard for settlement, so it
+      // is a refusal rather than a partial success.
       return fail({ kind: "too_large", detail: `response exceeds ${MAX_RESPONSE_BYTES} bytes` });
     }
-
-    // Success: commit reservation with actual bytes and paidUnits
-    commitReservation(reservationId, {
-      bytes,
-      paidUnits: args.paidUnits ?? 0,
-      stateDir: args.stateDir,
-      now,
-    });
 
     const success: FetchSuccess = {
       url: args.url,
@@ -938,3 +558,4 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
     return { ok: true, ...success };
   }
 }
+
