@@ -68,7 +68,34 @@
  */
 
 import { sha256Hex } from "@/lib/content-hash";
-import type { FetchSuccess } from "./gateway";
+export const DEFAULT_CONTENT_VALIDATION_POLICY_REVISION = "v1";
+
+/**
+ * Return the active content-validation policy revision.
+ * Configured via RESEARCH_CONTENT_VALIDATION_POLICY_REVISION (or RESEARCH_CONTENT_VALIDATION_REVISION).
+ * Defaults to DEFAULT_CONTENT_VALIDATION_POLICY_REVISION ("v1").
+ */
+export function getContentValidationPolicyRevision(): string {
+  const envVal =
+    process.env.RESEARCH_CONTENT_VALIDATION_POLICY_REVISION?.trim() ||
+    process.env.RESEARCH_CONTENT_VALIDATION_REVISION?.trim();
+  return envVal || DEFAULT_CONTENT_VALIDATION_POLICY_REVISION;
+}
+
+export interface FetchSuccess {
+  url: string;
+  finalUrl: string;
+  status: number;
+  contentType: string;
+  body: string;
+  contentHash: string;
+  capturedAt: number;
+  bytes: number;
+  fromCache: boolean;
+  redirects: number;
+  redirectChain: string[];
+  policyRevision?: string;
+}
 
 // ── Validity states ───────────────────────────────────────────────────────────
 
@@ -133,6 +160,8 @@ export interface ContentValidationResult {
    * state, and on `valid` if any non-advisory privacy finding was detected.
    */
   usable: boolean;
+  /** Content-validation policy revision applied to this decision. */
+  policyRevision?: string;
 }
 
 // ── Validation options ────────────────────────────────────────────────────────
@@ -166,6 +195,8 @@ export interface ContentValidationOpts {
   strict?: boolean;
   /** Inject the SHA-256 implementation (test seam). Defaults to sha256Hex. */
   hashFn?: (input: string) => string;
+  /** Expected content-validation policy revision. Defaults to active revision. */
+  policyRevision?: string;
 }
 
 // ── Patterns ──────────────────────────────────────────────────────────────────
@@ -279,23 +310,44 @@ export function validateResearchContent(
   success: FetchSuccess,
   opts: ContentValidationOpts = {},
 ): ContentValidationResult {
+  const activeRevision =
+    opts.policyRevision?.trim() || getContentValidationPolicyRevision();
+
   // Emergency escape hatch: skip all validation if explicitly disabled.
   if (process.env.RESEARCH_CONTENT_VALIDATION_DISABLED === "1") {
-    return { state: "valid", reason: "", privacyFindings: [], usable: true };
+    return { state: "valid", reason: "", privacyFindings: [], usable: true, policyRevision: activeRevision };
   }
 
   const strict =
     opts.strict ?? process.env.RESEARCH_CONTENT_VALIDATION_STRICT === "1";
 
+  const toResult = (
+    state: ResearchContentState,
+    reason: string,
+    privacyFindings: PrivacyFinding[],
+    usable: boolean,
+  ): ContentValidationResult =>
+    result(state, reason, privacyFindings, usable, activeRevision);
+
   try {
     const hashFn = opts.hashFn ?? sha256Hex;
+
+    // Incompatible cached decision check: if the result was bound to an incompatible revision, refuse it.
+    if (success.policyRevision !== undefined && success.policyRevision !== activeRevision) {
+      return toResult(
+        "invalid",
+        `content-validation policy revision mismatch: result was bound to revision '${success.policyRevision}' but active policy revision is '${activeRevision}'`,
+        [],
+        false,
+      );
+    }
 
     // ── 1. Structural checks — must pass before anything else ────────────────
 
     // An empty body is not a resolution source. Whitespace-only bodies are
     // treated the same: they carried no evidence.
     if (!success.body.trim()) {
-      return result("invalid", "fetched body is empty", [], false);
+      return toResult("invalid", "fetched body is empty", [], false);
     }
 
     // Hash integrity: the gateway stores the SHA-256 of the body at capture
@@ -303,7 +355,7 @@ export function validateResearchContent(
     // mutated in transit or storage — do not settle on it.
     const computedHash = hashFn(success.body);
     if (computedHash !== success.contentHash) {
-      return result(
+      return toResult(
         "invalid",
         `content hash mismatch: recorded ${success.contentHash} but body hashes to ${computedHash}`,
         [],
@@ -314,7 +366,7 @@ export function validateResearchContent(
     // ── 2. Lifecycle state checks (order: cancelled > dependency > stale > dup) ─
 
     if (opts.cancelled) {
-      return result(
+      return toResult(
         "cancelled",
         "the requesting agent or market was cancelled; this content must not be used for settlement",
         [],
@@ -331,14 +383,14 @@ export function validateResearchContent(
         ? findings.length > 0
         : findings.some((f) => !f.advisory);
       if (blockedByPrivacy) {
-        return result(
+        return toResult(
           "invalid",
           "dependency failure and privacy findings block use",
           findings,
           false,
         );
       }
-      return result(
+      return toResult(
         "dependency_failure",
         "a sibling fetch in the same context pack failed; this result is degraded",
         findings,
@@ -352,7 +404,7 @@ export function validateResearchContent(
     const now = Date.now();
     const ageSeconds = Math.max(0, (now - success.capturedAt) / 1_000);
     if (ageSeconds > maxAgeSeconds) {
-      return result(
+      return toResult(
         "stale",
         `content is ${Math.round(ageSeconds)}s old; limit is ${maxAgeSeconds}s`,
         [],
@@ -363,7 +415,7 @@ export function validateResearchContent(
     // ── 4. Duplication ────────────────────────────────────────────────────────
 
     if (opts.seenHashes?.has(success.contentHash)) {
-      return result(
+      return toResult(
         "duplicated",
         `content hash ${success.contentHash} already seen in this cycle; treating as duplicate`,
         [],
@@ -383,7 +435,7 @@ export function validateResearchContent(
 
     if (blockedByPrivacy) {
       const kinds = privacyFindings.map((f) => f.kind).join(", ");
-      return result(
+      return toResult(
         "invalid",
         `privacy-sensitive content detected: ${kinds}`,
         privacyFindings,
@@ -392,7 +444,7 @@ export function validateResearchContent(
     }
 
     // Advisory findings only: content is valid but the caller should note them.
-    return result(
+    return toResult(
       "valid",
       privacyFindings.length > 0
         ? `advisory privacy findings: ${privacyFindings.map((f) => f.kind).join(", ")}`
@@ -404,7 +456,7 @@ export function validateResearchContent(
     // Any unexpected error inside the validator is surfaced as invalid, so a
     // validator bug cannot accidentally pass bad content.
     const detail = err instanceof Error ? err.message : String(err);
-    return result("invalid", `validator error: ${detail}`, [], false);
+    return toResult("invalid", `validator error: ${detail}`, [], false);
   }
 }
 
@@ -415,8 +467,9 @@ function result(
   reason: string,
   privacyFindings: PrivacyFinding[],
   usable: boolean,
+  policyRevision: string = getContentValidationPolicyRevision(),
 ): ContentValidationResult {
-  return { state, reason, privacyFindings, usable };
+  return { state, reason, privacyFindings, usable, policyRevision };
 }
 
 /**
