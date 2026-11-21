@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  computeStakeSizing,
   filterJoinableClaims,
   shouldBuySecondOpinion,
   computeSignalDigest,
@@ -105,7 +106,6 @@ test("shouldBuySecondOpinion: returns false when mimirUrl is unset or empty", ()
 });
 
 test("shouldBuySecondOpinion: returns false when claim or required claim fields are missing", () => {
-  // missing claim entirely
   assert.equal(
     shouldBuySecondOpinion({
       buySecondOpinion: true,
@@ -115,8 +115,6 @@ test("shouldBuySecondOpinion: returns false when claim or required claim fields 
     }),
     false,
   );
-
-  // missing question
   assert.equal(
     shouldBuySecondOpinion({
       buySecondOpinion: true,
@@ -135,8 +133,6 @@ test("shouldBuySecondOpinion: returns false when claim or required claim fields 
     }),
     false,
   );
-
-  // missing resolution_url
   assert.equal(
     shouldBuySecondOpinion({
       buySecondOpinion: true,
@@ -158,19 +154,14 @@ test("shouldBuySecondOpinion: returns false when claim or required claim fields 
 });
 
 test("shouldBuySecondOpinion: supports positional argument signature", () => {
-  // Valid non-dry-run
   assert.equal(
     shouldBuySecondOpinion(true, "https://mimir.example.com", false, VALID_CLAIM),
     true,
   );
-
-  // Dry-run returns false
   assert.equal(
     shouldBuySecondOpinion(true, "https://mimir.example.com", true, VALID_CLAIM),
     false,
   );
-
-  // Disabled buying returns false
   assert.equal(
     shouldBuySecondOpinion(false, "https://mimir.example.com", false, VALID_CLAIM),
     false,

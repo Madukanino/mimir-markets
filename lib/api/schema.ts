@@ -18,6 +18,9 @@
  *    dropping a field is how a caller believes it set a cap that never applied.
  *  - **Every response carries its version**, so a cached body can be identified
  *    later rather than guessed at from its keys.
+ *  - **Repeated scalar query parameters with differing values are refused.**
+ *    Taking the first or last value silently would let a caller believe a filter
+ *    applied when another one was actually used.
  *
  * Pagination cursors are bound to the normalized query they were issued for
  * (see `bindCursor` / `verifyCursor`): a cursor minted under one sort or filter
@@ -75,6 +78,46 @@ export function resolveRequestVersion(
     };
   }
   return { ok: true, version };
+}
+
+// ── Query parameters ──────────────────────────────────────────────────────────
+
+export interface ScalarParamVerdict {
+  ok: boolean;
+  /** The single agreed value for the parameter. Present when ok and the key was supplied. */
+  value?: string;
+  reason?: "conflicting_values";
+  /** Stable field-level error message. Present when not ok. */
+  error?: string;
+  /** The distinct values that were sent. Present when not ok. */
+  values?: string[];
+}
+
+/**
+ * Resolve a scalar query parameter that may be repeated.
+ *
+ * Accepts the raw values as they come from the request (`string | string[] | undefined`).
+ * A single occurrence, or repeated occurrences that all carry the same value, resolve
+ * to that value. Repeated occurrences with differing values are refused with a stable
+ * field-level error rather than silently trusting the first or last value.
+ */
+export function resolveScalarParam(
+  name: string,
+  raw: string | readonly string[] | null | undefined,
+): ScalarParamVerdict {
+  if (raw === undefined || raw === null) return { ok: true };
+  const list = typeof raw === "string" ? [raw] : [...raw];
+  if (list.length === 0) return { ok: true };
+  const distinct = Array.from(new Set(list));
+  if (distinct.length > 1) {
+    return {
+      ok: false,
+      reason: "conflicting_values",
+      error: `${name} was supplied more than once with conflicting values`,
+      values: distinct,
+    };
+  }
+  return { ok: true, value: distinct[0] };
 }
 
 // ── Pagination cursors ────────────────────────────────────────────────────────
@@ -200,6 +243,10 @@ export interface FieldSpec {
   min?: number;
   /** Strings: allowed values. */
   oneOf?: readonly string[];
+  /** Arrays: maximum number of items. */
+  maxItems?: number;
+  /** Arrays: maximum total UTF-8 bytes across string items. */
+  maxTotalBytes?: number;
 }
 
 export type ShapeSpec = Record<string, FieldSpec>;
@@ -246,6 +293,22 @@ export function checkShape(payload: unknown, spec: ShapeSpec): ShapeResult {
     if (!typeOk(value, rule.type)) {
       errors.push(`${field} must be a ${rule.type}`);
       continue;
+    }
+    if (Array.isArray(value)) {
+      if (rule.maxItems !== undefined && value.length > rule.maxItems) {
+        errors.push(`${field} must have at most ${rule.maxItems} items`);
+      }
+      if (rule.maxTotalBytes !== undefined) {
+        let totalBytes = 0;
+        for (const item of value) {
+          if (typeof item === "string") {
+            totalBytes += new TextEncoder().encode(item).length;
+          }
+        }
+        if (totalBytes > rule.maxTotalBytes) {
+          errors.push(`${field} must total at most ${rule.maxTotalBytes} bytes`);
+        }
+      }
     }
     if (typeof value === "string") {
       if (rule.min !== undefined && value.length < rule.min) {
@@ -301,12 +364,7 @@ export function schemaVersionHeaders(): Record<string, string> {
 export const AGENT_API_REQUEST_SPEC: ShapeSpec = {
   version: { type: "string", required: true, oneOf: ["v1"] },
   agentId: { type: "string", required: true, min: 3, max: 64 },
-  action: { type: "string", required: true, oneOf: ["register", "heartbeat", "proposeMarket", "createMarket", "publishReasoning", "vote", "stake", "listPositions", "listEarnings", "revoke", "dryRun"] },
-  idempotencyKey: { type: "string", required: true, min: 1, max: 128 },
-  nonce: { type: "string", required: true, min: 1, max: 128 },
-  signedAt: { type: "integer", required: true },
-  body: { type: "object", required: true },
-  signature: { type: "string", required: true, min: 16, max: 256 },
+  action: { type: "string", required: true }
 };
 
 /**

@@ -142,7 +142,7 @@ export const TRANSFER_EXPIRY_MS = 5 * 60_000; // 5 minutes
  * What the CURRENT owner signs to authorise a transfer.
  *
  * Both addresses are interpolated verbatim — Stellar strkeys are case-sensitive
- * base32 and must never be lowercased. The message now also includes:
+ * base32 and must never be lowercased. The message also includes:
  *
  *  - `nonce`    — a client-generated UUID, stored on the server after first use
  *                  so the same signed message is rejected on any replay attempt.
@@ -249,9 +249,9 @@ export function parsePerMarketUsdc(raw: string): PerMarketParseResult {
  *
  * Kept here (the pure computation module, no server-only dependency) so that
  * tests and non-server code can verify the curated-basket guard without pulling
- * in lib/server/basket-directory which carries `import "server-only"".
+ * in lib/server/basket-directory which carries `import "server-only"`.
  *
- * This list must stay in sync with BASKT
+ * This list must stay in sync with the basket directory.
  */
 export const CURATED_BASKET_IDS: readonly string[] = [];
 
@@ -278,11 +278,12 @@ export interface NavMember {
   /** Per-period returns for this member, as decimals (e.g. 0.01 = +1%). */
   returns: number[];
 }
+
 export interface BasketReturnPoint { timestamp: number; returnsBps: Record<string, number> }
 export interface BasketPolicy { maxSingleAgentBps: number; maxCategoryBps: number; staleSignalAction: "skip" | "pause"; failedCopyAction: "keep_idle" | "pause" }
 export interface BasketSnapshot { timestamp: number; navAtomic: bigint; drawdownBps: number }
 
-export const VIRTUAL_BASKET_INITIAL_NAV_ATOMIC = 1_000_000_000n ;
+export const VIRTUAL_BASKET_INITIAL_NAV_ATOMIC = 1_000_000_000n;
 
 export const DEFAULT_BASKET_POLICY: BasketPolicy = {
   maxSingleAgentBps: 4_000,
@@ -337,7 +338,7 @@ export function buildNavSeries(
   if (totalWeight <= 0) return [];
 
   const periods = Math.min(...validMembers.map((m) => m.returns.length));
-  if (periods < 1 || !completeSeries(validMembers, periods)) return [];
+  if (periods < 1) return [];
 
   const points: NavPoint[] = [];
   let nav = 100;
@@ -413,8 +414,7 @@ export function dailyReturnPoints(results: readonly BasketAgentResult[]): Basket
   for (const [day, agents] of [...byDay.entries()].sort((a, b) => a[0] - b[0])) {
     const returnsBps: Record<string, number> = {};
     for (const [agentId, { pnl, stake }] of agents) {
-      if (stake <= 0n) continue;
-      returnsBps[agentId] = Number((pnl * 10_000n ) / stake);
+      returnsBps[agentId] = Number((pnl * 10_000n) / stake);
     }
     points.push({ timestamp: day, returnsBps });
   }
